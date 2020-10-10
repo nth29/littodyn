@@ -6,10 +6,11 @@ import os
 from osgeo import osr, gdal, ogr
 import sys
 import argparse
-#import pylab
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from collections import Counter
+from scipy.spatial import distance
+import pylab
 
 class Change_detector(object):
     """
@@ -78,22 +79,17 @@ class Change_detector(object):
         self.ds.GetRasterBand(1).WriteArray(self.change)
             
 
-class Change_detector_norm_euclid(Change_detector):
-    """
-    A change with only euclidian distance
-    """
-
-    def _dodetect(self):
-        self.change=np.sqrt(np.sum((self.img1-self.img2)**2,axis=2))
-
 
 class Change_detector_PCA(Change_detector):
     """
     A change detector with PCA + kmeans
     """
 
-    def _find_vector_set(self, diff_image):   
-        vector_set = np.reshape(diff_image,[diff_image.shape[0]*diff_image.shape[1],diff_image.shape[2]])
+    def _find_vector_set(self, diff_image):
+        self.isdata=np.where(self.roi_mask)
+        vector_set=np.zeros([len(self.isdata[0]),diff_image.shape[2]],dtype=np.float)
+        for i in range(len(self.isdata[0])):
+            vector_set[i,:]=diff_image[self.isdata[0][i], self.isdata[1][i],:]
         mean_vec   = np.mean(vector_set, axis = 0)
         vector_set -= mean_vec
     
@@ -101,8 +97,10 @@ class Change_detector_PCA(Change_detector):
     
   
     def _find_FVS(self, EVS, diff_image, mean_vec):
-    
-        feature_vector_set = np.reshape(diff_image,[diff_image.shape[0]*diff_image.shape[1],diff_image.shape[2]])
+        feature_vector_set=np.zeros([len(self.isdata[0]),diff_image.shape[2]],dtype=np.float)
+        for i in range(len(self.isdata[0])):
+            feature_vector_set[i,:]=diff_image[self.isdata[0][i], self.isdata[1][i],:]
+ 
         FVS = np.dot(feature_vector_set, EVS)
         FVS = FVS - mean_vec
         return FVS
@@ -114,14 +112,16 @@ class Change_detector_PCA(Change_detector):
         output = kmeans.predict(FVS)
         count  = Counter(output)
 
-        least_index = min(count, key = count.get)         
-        change_map  = np.reshape(output,new)
+        max_index = max(count, key = count.get)
+        change_map=np.zeros(new)+np.nan
+        for i in range(len(self.isdata[0])):
+            change_map[self.isdata[0][i], self.isdata[1][i]]=output[i]
     
-        return least_index, change_map
+        return max_index, change_map
 
     def _dodetect(self):
     
-        diff_image = abs(self.img1 - self.img2) 
+        diff_image = np.abs(self.img1 - self.img2)
         
         vector_set, mean_vec = self._find_vector_set(diff_image)
     
@@ -132,17 +132,118 @@ class Change_detector_PCA(Change_detector):
         FVS = self._find_FVS(EVS, diff_image, mean_vec)
     
         components = 3
-        least_index, change_map = self._clustering(FVS, components, [diff_image.shape[0],diff_image.shape[1]])
-    
-        change_map[change_map == least_index] = 255
-        change_map[change_map != 255] = 0
-    
-        self.change = change_map.astype(np.float32)
+        max_index, self.change = self._clustering(FVS, components, [diff_image.shape[0],diff_image.shape[1]])
 
 
+
+class Change_detector_normEUCL(Change_detector):
+    """
+    A change with only euclidian distance
+    """
+
+    def _dodetect(self):
+        self.change=np.sqrt(np.sum((self.img1-self.img2)**2,axis=2))
+
         
+class Change_detector_normCORR(Change_detector):
+    """
+    A change with only correlation distance
+    """
+
+    def _dodetect(self):
+        dist = np.zeros((self.img1.shape[0],self.img1.shape[1]))
+        for i in range(self.img1.shape[0]):
+            for j in range(self.img1.shape[1]):
+                dist[i,j] = distance.correlation(self.img1[i,j,:], self.img2[i,j,:])
+        self.change=dist
+
+class Change_detector_normCOS(Change_detector):
+    """
+    A change with only cosine distance
+    """
+
+    def _dodetect(self):
+        dist = np.zeros((self.img1.shape[0],self.img1.shape[1]))
+        for i in range(self.img1.shape[0]):
+            for j in range(self.img1.shape[1]):
+                dist[i,j] = distance.cosine(self.img1[i,j,:], self.img2[i,j,:])
+        self.change=dist
+
+
+class Change_detector_VI(Change_detector):
+    """
+    Generic class for vegetation index based change detectors
+    Expected input images bands are
+    1 : Blue
+    2 : Green
+    3 : Red
+    4 : Infra Red
+    """
+
+    def _dodetect(self):
+        """
+        For vegetaion indexes we always return abs diff between the vegetation indexes of input images
+        """
+
+        vi1=self._vi(self.img1)
+        vi2=self._vi(self.img2)
+        dist = np.zeros((self.img1.shape[0],self.img1.shape[1]))
+        self.change=np.abs(vi2-vi1)
+
+    def _vi(self):
+        """
+        Vegetation index
+        """
+        pass
+
         
-           
+class Change_detector_NDVI(Change_detector_VI):
+    """
+    A change with ndvi
+    Normalized vegetation index (https://www.indexdatabase.de/db/i-single.php?id=58)
+    Simple
+    NDVI = (NIR-R)/(NIR+R)
+    """  
+
+    def _vi(self,img):
+        """
+        ndvi of image
+        """
+        return (img[:,:,3]-img[:,:,2])/(img[:,:,3]+img[:,:,2])
+
+
+class Change_detector_EVI(Change_detector_VI):
+    """
+    A change with evi
+    * EVI : enhanced vegetation index (https://www.indexdatabase.de/db/i-single.php?id=16)
+    More robuste to atmo effects
+    EVI = 2.5 * ((NIR - R) / (NIR + 6 * R – 7.5 * B + 1)) 
+    """
+ 
+    def _vi(self,img):
+        """
+        evi of image
+        """
+        return 2.5*((img[:,:,3]-img[:,:,2])/(img[:,:,3]+6*img[:,:,2]-7.5*img[:,:,0]+1))
+
+
+class Change_detector_NGRDI(Change_detector_VI):
+    """
+    A change with NGRDI
+    * NGDRI : https://www.indexdatabase.de/db/i-single.php?id=390)
+    For sea bottom
+    NGRDI= (Green - Red)/(Green + Red) `
+    """
+
+    def _vi(self,img):
+        """
+        ngrdi of image
+        """
+        return (img[:,:,1]-img[:,:,2])/(img[:,:,1]+img[:,:,2])
+
+
+
+    
 
 if __name__ == "__main__":
 
@@ -165,11 +266,26 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+
+
+    dict_algos={"PCA":Change_detector_PCA,
+                "EUCL":Change_detector_normEUCL,
+                "CORR":Change_detector_normCORR,
+                "COS":Change_detector_normCOS,
+                "NDVI":Change_detector_NDVI,
+                "EVI":Change_detector_EVI,
+                "NGRDI":Change_detector_NGRDI}
+                
+
+    for mykey in dict_algos.keys():
+        myobj=dict_algos[mykey](args.path_img1,
+                                args.path_img2,
+                                args.path_roi,
+        )
+        myobj.detect()
+        myobj.save(os.path.splitext(args.path_out)[0]+"_"+mykey+".tif")
     
-    myobj=Change_detector_PCA(args.path_img1,
-                               args.path_img2,
-                               args.path_roi,
-                               )
-    myobj.detect()
-    myobj.save(args.path_out)
-    
+#python change_detector.py ./test_data/spartine_19732595141368_20160504.tif ./test_data/spartine_17918458994113_20180628.tif ./test_data/spartine_roi.shp ./test_data/spartine_change.tif
+#python change_detector.py ./test_data/herbiers_19333594309023_20160504.tif ./test_data/herbiers_17383394389091_20181009.tif ./test_data/herbiers_roi.shp ./test_data/herbiers_change.tif
+#python change_detector.py ./test_data/ouessant_20170706_102911_0f43_AnalyticMS_SR.tif ./test_data/ouessant_20180707_104507_1014_AnalyticMS_SR.tif ./test_data/ouessant_roi.shp ./test_data/ouessant_change.tif
+
